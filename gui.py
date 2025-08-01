@@ -1,19 +1,110 @@
 import wx
 from typing import Dict, List, Callable
+import threading
+import json
+import pprint
+import requests
+import json
+from dataclasses import dataclass
+from http import HTTPStatus
+import sys
+import pprint
+import copy
+
+@dataclass
+class ClockifyConfig:
+    api_key      : str
+    workspace_id : str
+
+@dataclass
+class ClockifyTask:
+    id   : str
+    name : str
+
+@dataclass
+class ClockifyProject:
+    id   : str
+    name : str
+    tasks : list[ClockifyTask]
+
+def read_config(config_file_path):
+    with open(config_file_path, "r") as f:
+         data = json.load(f)
+    return ClockifyConfig(**data)
+
+class Clockify:
+    BASE_URL = "https://api.clockify.me/api/v1"
+
+    def __init__(self, config: ClockifyConfig):
+        self._config      = config
+
+    def get_projects(self):
+        projects_list = []
+        page = 0
+        while True:
+            page += 1 
+            
+            url = f'https://api.clockify.me/api/v1/workspaces/{self._config.workspace_id}/projects?page={page}&page-size=5000&archived=false'            
+            response = requests.get(url, headers={'X-Api-Key': self._config.api_key})
+
+            if response.status_code == HTTPStatus.OK:
+                projects_this_page = response.json()
+                if (len(projects_this_page) > 0):
+                    projects_list.extend([ClockifyProject(id=project['id'], name=project['name'], tasks=self._get_project_tasks(project['id'])) for project in projects_this_page])
+                else:
+                    break
+            else:
+                raise RuntimeError(f"Failed to get projects: {response.reason}\nResponse contents:\n{response.text.decode()}")
+            
+        return projects_list
+
+    def _get_project_tasks(self, project_id : str):
+        # Doubt there'l be more than 5000 tasks for a project so just use 1st page!
+        url = f"{self.BASE_URL}/workspaces/{self._config.workspace_id}/projects/{project_id}/tasks?page=1&page-size=5000"
+        response = requests.get(url, headers={
+            "X-Api-Key": self._config.api_key,
+            "Content-Type": "application/json"
+        })
+
+        if response.status_code != HTTPStatus.OK:
+            raise RuntimeError(f"Failed to get tasks for project '{project_id}': {response.reason}\nResponse contents:\n{response.text.decode()}")
+
+        tasks = response.json()
+
+        return [ClockifyTask(id=task['id'], name=task['name']) for task in tasks]
+
+
+
+class GetProjectsAndTasks(threading.Thread):
+    def __init__(self, cb, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cb = cb
+
+    def run(self):
+        print("Running thread")
+        clockify_cfg = read_config("config.json")
+        clockify = Clockify(clockify_cfg)
+        myprojects = clockify.get_projects()
+        self._cb(myprojects)
+
+
 
 class Model:
     """Model class that holds project and task data"""
     
     def __init__(self):
         self._observers: List[Callable] = []
-        self._projects_data = {
-            "Website Redesign": ["Design Mockups", "Code Review", "Bug Fixes", "Deployment"],
-            "Mobile App": ["UI Design", "API Integration", "Unit Tests", "App Store Release"],
-            "Database Migration": ["Schema Design", "Data Transfer", "Performance Testing", "Documentation"],
-            "API Development": ["Endpoint Design", "Authentication", "Testing", "Documentation"],
-            "Testing Framework": ["Test Planning", "Automation Scripts", "Bug Reports", "Code Coverage"]
-        }
-    
+        self._projects = []
+        self._api_thread = GetProjectsAndTasks(self.cb)
+        self._mutex = threading.Lock()
+        self._api_thread.start()
+
+    def cb(self, projects):
+        with self._mutex:
+            self._projects = projects
+        
+        self.notify_observers()
+
     def add_observer(self, callback: Callable):
         """Add observer callback for model updates"""
         self._observers.append(callback)
@@ -25,16 +116,24 @@ class Model:
     
     def notify_observers(self):
         """Notify all observers of model changes"""
+        print("NOTIFY")
         for callback in self._observers:
             callback()
     
     def get_projects(self) -> List[str]:
         """Get list of all projects"""
-        return list(self._projects_data.keys())
+        project_copy = None
+        with self._mutex:
+            project_copy = copy.deepcopy(self._projects)
+        return project_copy
     
-    def get_tasks_for_project(self, project: str) -> List[str]:
+    def get_tasks_for_project(self, project) -> List[str]:
         """Get tasks for a specific project"""
-        return self._projects_data.get(project, [])
+        tasks_copy = None
+        with self._mutex:
+            tasks_copy = copy.deepcopy(project.tasks)
+        print(f"GOT TASKS {tasks_copy}")
+        return tasks_copy
     
     def add_project(self, project: str, tasks: List[str] = None):
         """Add a new project with tasks"""
@@ -53,7 +152,7 @@ class MainView(wx.Frame):
     """View class - handles GUI display and user interactions"""
     
     def __init__(self):
-        super().__init__(None, title="MVP GUI Application", size=(600, 400))
+        super().__init__(None, title="MVP GUI Application", size=(800, 400))
         
         # Create main panel
         panel = wx.Panel(self)
@@ -67,6 +166,7 @@ class MainView(wx.Frame):
         # Create 6 text panels
         self.text_panels = []
         self.text_labels = []  # Store references to labels
+        self.panel_data  = [None, None, None, None, None, None]
         self.selected_panel = None
         self.selected_panel_index = None
         
@@ -76,14 +176,19 @@ class MainView(wx.Frame):
             
             # Add "Text" label
             text_sizer = wx.BoxSizer(wx.VERTICAL)
-            text_label = wx.StaticText(text_panel, label="Text")
+            if i < 5:
+                text_label = wx.StaticText(text_panel, label="")
+            else:
+                text_label = wx.StaticText(text_panel, label="Stop any task")
             text_label.SetFont(wx.Font(9, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
             text_sizer.Add(text_label, 1, wx.CENTER | wx.ALL | wx.EXPAND, 5)
             text_panel.SetSizer(text_sizer)
             
             # Make panels clickable
-            text_panel.Bind(wx.EVT_LEFT_DOWN, lambda evt, panel_idx=i: self.on_panel_click(evt, panel_idx))
-            text_label.Bind(wx.EVT_LEFT_DOWN, lambda evt, panel_idx=i: self.on_panel_click(evt, panel_idx))
+            if i < 5:
+                # 6th box not selectable
+                text_panel.Bind(wx.EVT_LEFT_DOWN, lambda evt, panel_idx=i: self.on_panel_click(evt, panel_idx))
+                text_label.Bind(wx.EVT_LEFT_DOWN, lambda evt, panel_idx=i: self.on_panel_click(evt, panel_idx))
             
             # Draw border
             text_panel.Bind(wx.EVT_PAINT, lambda evt, panel=text_panel, is_red=(i==5): self.on_paint_panel(evt, panel, is_red))
@@ -98,14 +203,14 @@ class MainView(wx.Frame):
         # Project field
         project_sizer = wx.BoxSizer(wx.HORIZONTAL)
         project_label = wx.StaticText(panel, label="Project")
-        self.project_combo = wx.ComboBox(panel, style=wx.CB_READONLY, size=(150, -1))
+        self.project_combo = wx.ComboBox(panel, style=wx.CB_READONLY, size=(300, -1))
         project_sizer.Add(project_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
         project_sizer.Add(self.project_combo, 1, wx.EXPAND)
         
         # Task field
         task_sizer = wx.BoxSizer(wx.HORIZONTAL)
         task_label = wx.StaticText(panel, label="Task")
-        self.task_combo = wx.ComboBox(panel, style=wx.CB_READONLY, size=(150, -1))
+        self.task_combo = wx.ComboBox(panel, style=wx.CB_READONLY, size=(300, -1))
         task_sizer.Add(task_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
         task_sizer.Add(self.task_combo, 1, wx.EXPAND)
         
@@ -149,34 +254,40 @@ class MainView(wx.Frame):
         """Set the presenter for this view"""
         self.presenter = presenter
     
-    def populate_projects(self, projects: List[str]):
+    def populate_projects(self, projects: List):
         """Populate the project dropdown"""
-        current_selection = self.project_combo.GetValue()
         self.project_combo.Clear()
-        self.project_combo.AppendItems(projects)
+        for project in projects:
+            self.project_combo.Append(project.name, clientData=project)
         
-        # Restore selection if it still exists
-        if current_selection in projects:
-            self.project_combo.SetValue(current_selection)
-    
-    def populate_tasks(self, tasks: List[str]):
+    def populate_tasks(self, tasks: List):
         """Populate the task dropdown"""
-        current_selection = self.task_combo.GetValue()
         self.task_combo.Clear()
-        self.task_combo.AppendItems(tasks)
-        
-        # Restore selection if it still exists
-        if current_selection in tasks:
-            self.task_combo.SetValue(current_selection)
+        for task in tasks:
+            print(f"APPEND {task.name}")
+            self.task_combo.Append(task.name, clientData=task)
     
     def get_selected_project(self) -> str:
         """Get currently selected project"""
-        return self.project_combo.GetValue()
+        #return self.project_combo.GetValue()
+        index = self.project_combo.GetSelection()
+        client_data = ""
+        if index >= 0:
+            label = self.project_combo.GetString(index)
+            client_data = self.project_combo.GetClientData(index)
+        return client_data
     
     def get_selected_task(self) -> str:
         """Get currently selected task"""
-        return self.task_combo.GetValue()
-    
+        #return self.task_combo.GetValue()
+        index = self.task_combo.GetSelection()
+        client_data = ""
+        if index >= 0:
+            label = self.task_combo.GetString(index)
+            client_data = self.task_combo.GetClientData(index)
+        return client_data
+
+
     def on_panel_click(self, event, panel_index):
         """Handle panel click - select and highlight"""
         self.selected_panel = self.text_panels[panel_index]
@@ -251,11 +362,11 @@ class MainView(wx.Frame):
         self.exit_btn.Refresh()
         self.Update()
     
-    def update_selected_panel_text(self, project: str, task: str):
+    def update_selected_panel_text(self, project, task):
         """Update the selected panel's text"""
         if self.selected_panel and self.selected_panel_index is not None:
             # Combine project and task text
-            combined_text = f"{project}\n{task}" if project and task else project or task or "Text"
+            combined_text = f"{project.name}\n{task.name}" if project and task else project.name or task.name or "Text"
             
             label = self.text_labels[self.selected_panel_index]
             label.SetLabel(combined_text)
@@ -302,6 +413,7 @@ class Presenter:
     
     def on_project_selected(self, project: str):
         """Handle project selection"""
+        print(f"Projct {project} selected")
         if project:
             tasks = self.model.get_tasks_for_project(project)
             self.view.populate_tasks(tasks)
